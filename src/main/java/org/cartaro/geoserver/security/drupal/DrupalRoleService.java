@@ -234,7 +234,17 @@ public class DrupalRoleService implements GeoServerRoleService {
 				return new GeoServerRole(role);
 			}
 		}
-		return null;
+		// getRoles() only enumerates roles that come straight from Drupal's
+		// "role" table plus the root role - it does not include the synthetic
+		// "authenticated user"/"anonymous user" roles (or the installation-time
+		// admin role) that getRolesForUser() hands out. Those are still real
+		// roles a user can hold, so falling back to null here made
+		// RoleCalculator.personalizeRoles() NPE (it always calls
+		// createRoleObject() on every role returned by personalizeRoleParams(),
+		// which never itself returns null) whenever a user page tried to show
+		// calculated roles for such a user. Returning a role object here for
+		// any authority we're asked about keeps that contract intact.
+		return new GeoServerRole(role);
 	}
 
 	public GeoServerRole getParentRole(GeoServerRole role) throws IOException {
