@@ -123,8 +123,9 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 		}
 		try {
 			connector.connect();
+			// Excludes uid=0 and blocked (status=0) accounts - see getUsers().
 			ResultSet rs = connector.getResultSet("select exists("
-					+ "select true from users where name=? and uid<>0" + ") as exists",
+					+ "select true from users where name=? and uid<>0 and status<>0" + ") as exists",
 					connector.stripInstancePrefix(username));
 			rs.next();
 			if (rs.getBoolean("exists")) {
@@ -157,8 +158,9 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 		try {
 			connector.connect();
 			// Excludes uid=0 - Drupal's own "anonymous"/not-logged-in pseudo-user
-			// (empty name), not a real account.
-			ResultSet rs = connector.getResultSet("select name from users where uid<>0");
+			// (empty name), not a real account - and blocked (status=0) accounts,
+			// which Drupal itself treats as unable to log in.
+			ResultSet rs = connector.getResultSet("select name from users where uid<>0 and status<>0");
 			while (rs.next()) {
 				final String prefixedName = connector.addInstancePrefix(rs.getString("name"));
 				if (namesOwnedElsewhere.contains(prefixedName)) {
@@ -220,8 +222,8 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 		ResultSet rs;
 		try {
 			connector.connect();
-			// Excludes uid=0 - see getUsers().
-			rs = connector.getResultSet("select count(*) from users where uid<>0");
+			// Excludes uid=0 and blocked (status=0) accounts - see getUsers().
+			rs = connector.getResultSet("select count(*) from users where uid<>0 and status<>0");
 			rs.next();
 			return rs.getInt("count");
 		} catch (SQLException e) {
@@ -249,8 +251,8 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 			connector.connect();
 			rs = connector
 					.getResultSet(
-							// Excludes uid=0 - see getUsers().
-							"select users.name from users join users_roles using(uid) join role using(rid) where role.name=? and users.uid<>0",
+							// Excludes uid=0 and blocked (status=0) accounts - see getUsers().
+							"select users.name from users join users_roles using(uid) join role using(rid) where role.name=? and users.uid<>0 and users.status<>0",
 							connector.stripInstancePrefix(role).getAuthority());
 			while (rs.next()) {
 				final String prefixedName = connector.addInstancePrefix(
@@ -261,8 +263,9 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 			}
 
 			if(DRUPAL_ROOT_ROLE.equals(role)){
-				// id=1 means administrative privileges in Drupal
-				rs = connector.getResultSet("select name from users where uid=1");
+				// id=1 means administrative privileges in Drupal; still excludes a
+				// blocked (status=0) root account - see getUsers().
+				rs = connector.getResultSet("select name from users where uid=1 and status<>0");
 				if(rs.next()){
 					final String prefixedName = connector.addInstancePrefix(rs.getString("name"));
 					if (!namesOwnedElsewhere.contains(prefixedName)) {
@@ -284,10 +287,11 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 		TreeSet<GeoServerRole> roles = new TreeSet<GeoServerRole>();
 		try {
 			connector.connect();
+			// Excludes blocked (status=0) accounts - see getUsers().
 			ResultSet rs = connector
 					.getResultSet(
 							"select role.name from role join users_roles using(rid) join " +
-							"users using(uid) where users.name=?",
+							"users using(uid) where users.name=? and users.status<>0",
 							connector.stripInstancePrefix(
 									new GeoServerRole(username)).getAuthority());
 			while (rs.next()) {
@@ -299,8 +303,9 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 			if(connector.isDrupalCurrentlyInstalling()){
 				roles.add(connector.addInstancePrefix(INSTALLATION_ADMINISTRATOR));
 			} else {
-				// id=1 means administrative privileges in Drupal
-				ResultSet rsAdmin = connector.getResultSet("select uid=1 as admin from users where name=?", connector.stripInstancePrefix(username));
+				// id=1 means administrative privileges in Drupal; still excludes a
+				// blocked (status=0) root account - see getUsers().
+				ResultSet rsAdmin = connector.getResultSet("select uid=1 as admin from users where name=? and status<>0", connector.stripInstancePrefix(username));
 				if(rsAdmin.next() && rsAdmin.getBoolean("admin")){
 					roles.add(connector.addInstancePrefix(DRUPAL_ROOT_ROLE));
 				}
@@ -634,8 +639,8 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 				LOGGER.info("quering catalog for property " + propname);
 				connector.connect();
 				
-				// Excludes uid=0 - see getUsers().
-				String query = "select name from users where uid<>0 and (" + columnName + " ";
+				// Excludes uid=0 and blocked (status=0) accounts - see getUsers().
+				String query = "select name from users where uid<>0 and status<>0 and (" + columnName + " ";
 				if (propop==PropertyQueryOperator.HAS_PROPERTY) {
 					query += "is not null and " + columnName + "is distinct from '')";
 				}
@@ -681,8 +686,8 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 				LOGGER.info("quering catalog for property " + propname + " and value " + propvalue);
 				connector.connect();
 				
-				// Excludes uid=0 - see getUsers().
-				String query = "select name from users where uid<>0 and " + columnName + " is not distinct from ?";
+				// Excludes uid=0 and blocked (status=0) accounts - see getUsers().
+				String query = "select name from users where uid<>0 and status<>0 and " + columnName + " is not distinct from ?";
 				ResultSet rs = connector.getResultSet(query, propvalue);
 				while (rs.next()) {
 					users.add(new GeoServerUser(connector.addInstancePrefix(rs
