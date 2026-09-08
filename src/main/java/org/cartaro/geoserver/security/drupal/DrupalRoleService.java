@@ -50,7 +50,47 @@ public class DrupalRoleService implements GeoServerRoleService {
 	private Set<RoleLoadedListener> listeners = Collections
 			.synchronizedSet(new HashSet<RoleLoadedListener>());
 
+	/**
+	 * Name of the Drupal role (bare, not instance-prefixed) that should be
+	 * promoted to GeoServer's built-in full-administrator role on login. See
+	 * {@link #getConfiguredAdminRoleName()}.
+	 */
+	private String adminRoleName;
+
+	/**
+	 * Name of the Drupal role (bare, not instance-prefixed) that should be
+	 * promoted to GeoServer's built-in group-administrator role on login. See
+	 * {@link #getConfiguredGroupAdminRoleName()}.
+	 */
+	private String groupAdminRoleName;
+
 	public void initializeFromConfig(SecurityNamedServiceConfig config) {
+		DrupalSecurityServiceConfig drupalConfig = (DrupalSecurityServiceConfig) config;
+		adminRoleName = drupalConfig.getAdminRoleName();
+		groupAdminRoleName = drupalConfig.getGroupAdminRoleName();
+	}
+
+	/**
+	 * @return The Drupal role name configured (via this role service's "Admin
+	 *         Role" field) to be promoted to
+	 *         {@link GeoServerRole#ADMIN_ROLE} for whoever holds it, or null
+	 *         if none is configured. GeoServer's own admin check
+	 *         (GeoServerSecurityManager#checkAuthenticationForAdminRole) only
+	 *         ever looks for the literal "ROLE_ADMINISTRATOR" authority
+	 *         amongst a user's granted roles - it does not consult this
+	 *         service - so {@link DrupalUserGroupService#getRolesForUser}
+	 *         reads this value back out to perform that promotion itself.
+	 */
+	public String getConfiguredAdminRoleName() {
+		return adminRoleName;
+	}
+
+	/**
+	 * @return As {@link #getConfiguredAdminRoleName()}, but for
+	 *         {@link GeoServerRole#GROUP_ADMIN_ROLE}.
+	 */
+	public String getConfiguredGroupAdminRoleName() {
+		return groupAdminRoleName;
 	}
 
 	/**
@@ -66,6 +106,18 @@ public class DrupalRoleService implements GeoServerRoleService {
 		// accumulating threads watching users.xml
 		// it would be far better to prevent new threads from being spawned on each reload,
 		// but this is what we can do now.
+		//
+		// This reflects into GeoServerSecurityManager's private internals, which were
+		// last verified against GeoServer 2.2 (see comments below) and are NOT part of
+		// its public API - GeoServer 3.0 may have renamed/restructured them, or changed
+		// the "fileWatchers" field's type/nullness. Now that this service can be the
+		// *active* role service, getDrupalUserGroupServices() (and thus this block) runs
+		// on essentially every request that needs role info (including unrelated ones,
+		// e.g. GeoServer's own default-admin-password check on every home page load), so
+		// a mismatch here must never take down role/authentication handling. Catch
+		// broadly (including unchecked exceptions like NullPointerException or
+		// ClassCastException from an unexpected field shape) and treat any failure here
+		// as "nothing to clean up" rather than letting it propagate.
 		try {
 			LOGGER.log(Level.FINEST, "Attempting to terminate existing filewatchers in userGroupServiceHelper");
 			Field helperField = manager.getClass().getDeclaredField("userGroupServiceHelper");
@@ -77,26 +129,27 @@ public class DrupalRoleService implements GeoServerRoleService {
 			@SuppressWarnings("unchecked")
 			ArrayList<FileWatcher> fileWatchers = (ArrayList<FileWatcher>) fileWatchersField.get(helper);
 
-			// terminate all threads
-            for (FileWatcher fileWatcher : fileWatchers) {
-                LOGGER.log(Level.FINE, "Terminating existing filewatcher on "+fileWatcher.getFileInfo());
-                fileWatcher.setTerminate(true);
-            }
-			fileWatchers.clear();
+			if (fileWatchers != null) {
+				// terminate all threads
+				for (FileWatcher fileWatcher : fileWatchers) {
+					LOGGER.log(Level.FINE, "Terminating existing filewatcher on "+fileWatcher.getFileInfo());
+					fileWatcher.setTerminate(true);
+				}
+				fileWatchers.clear();
+			}
 
-		} catch (SecurityException e) {
-			LOGGER.log(Level.WARNING, "Access to member forbidden. Could not stop filewatchers.", e);
-		} catch (NoSuchFieldException e) {
-			LOGGER.log(Level.WARNING, "Could not access member. Could not stop filewatchers.", e);
-		}  catch (IllegalArgumentException e) {
-			LOGGER.log(Level.WARNING, "invalid argument. Could not stop filewatchers.", e);
-		} catch (IllegalAccessException e) {
-			LOGGER.log(Level.WARNING, "attribute can not be accessed. Could not stop filewatchers.", e);
 		} catch (ConcurrentModificationException e) {
             // two threads attempt to terminate the filewatchers concurrently.
             // this can be ignored as the otherthread will most certainly terminate the threads. Otherwise
             // they will be terminated during the next request [#3070068]
             LOGGER.log(Level.INFO, "Concurrent attempt to terminate filewatchers. Skipping termination.");
+        } catch (Exception e) {
+			// Catches SecurityException/NoSuchFieldException/IllegalArgumentException/
+			// IllegalAccessException from the reflection itself, plus anything unchecked
+			// (NullPointerException, ClassCastException, ...) from GeoServer's internals
+			// no longer matching the shape this reflection expects. Either way this is
+			// best-effort housekeeping only - safe to skip.
+			LOGGER.log(Level.WARNING, "Could not stop filewatchers via reflection into GeoServerSecurityManager's internals - skipping (this is best-effort cleanup, not required for correctness).", e);
         }
 
 
@@ -276,15 +329,15 @@ public class DrupalRoleService implements GeoServerRoleService {
 	}
 
 	public GeoServerRole getAdminRole() {
-		// There is no admin role since multiple Drupal installation might share
-		// the same GeoServer
-		return null;
+		// Multiple Drupal instances can share the same GeoServer, so this is
+		// only ever a single, admin-configured Drupal role name (see
+		// getConfiguredAdminRoleName()) rather than something derived
+		// per-instance.
+		return adminRoleName == null ? null : new GeoServerRole(adminRoleName);
 	}
 
 	public GeoServerRole getGroupAdminRole() {
-		// There is no admin role since multiple Drupal installation might share
-		// the same GeoServer
-		return null;
+		return groupAdminRoleName == null ? null : new GeoServerRole(groupAdminRoleName);
 	}
 
 	public int getRoleCount() throws IOException {

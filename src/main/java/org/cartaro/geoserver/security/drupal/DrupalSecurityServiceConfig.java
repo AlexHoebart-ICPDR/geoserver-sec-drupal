@@ -81,22 +81,33 @@ public class DrupalSecurityServiceConfig extends BaseSecurityNamedServiceConfig
 		this.databaseHost = databaseHost;
 	}
 
+	/**
+	 * Name of the Drupal role (as it appears in Drupal's own "role" table,
+	 * without any instance prefix) that should be treated as GeoServer's
+	 * full-administrator role. Only meaningful on the (single, active)
+	 * DrupalRoleService's own config - see
+	 * {@link DrupalRoleService#getConfiguredAdminRoleName()} for how it's
+	 * actually applied.
+	 */
+	private String adminRoleName;
+
 	public String getAdminRoleName() {
-		// There are no admins
-		return null;
+		return adminRoleName;
 	}
 
 	public void setAdminRoleName(String adminRoleName) {
-		// There are no admins
+		this.adminRoleName = adminRoleName;
 	}
+
+	/** @see #adminRoleName - same idea, for the group-administrator role. */
+	private String groupAdminRoleName;
 
 	public String getGroupAdminRoleName() {
-		// There are no admins
-		return null;
+		return groupAdminRoleName;
 	}
 
-	public void setGroupAdminRoleName(String adminRoleName) {
-		// There are no admins
+	public void setGroupAdminRoleName(String groupAdminRoleName) {
+		this.groupAdminRoleName = groupAdminRoleName;
 	}
 
 	private String passwordEncoderName;

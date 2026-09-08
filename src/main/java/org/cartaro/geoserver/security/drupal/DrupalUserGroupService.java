@@ -9,11 +9,15 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import org.geoserver.catalog.Catalog;
 import org.geoserver.catalog.LayerInfo;
+import org.geoserver.platform.GeoServerExtensions;
 import org.geoserver.security.AccessMode;
+import org.geoserver.security.GeoServerRoleService;
+import org.geoserver.security.GeoServerSecurityManager;
 import org.geoserver.security.GeoServerUserGroupService;
 import org.geoserver.security.GeoServerUserGroupStore;
 import org.geoserver.security.config.SecurityNamedServiceConfig;
@@ -111,10 +115,16 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 
 	public GeoServerUser getUserByUsername(String username) throws IOException {
 		LOGGER.info("Drupal GroupService loads user");
+		if (getUsernamesDefinedByOtherUserGroupServices().contains(username)) {
+			// Another (non-Drupal) service already owns this username - defer
+			// to it rather than also claiming it. See
+			// getUsernamesDefinedByOtherUserGroupServices().
+			return null;
+		}
 		try {
 			connector.connect();
 			ResultSet rs = connector.getResultSet("select exists("
-					+ "select true from users where name=?" + ") as exists",
+					+ "select true from users where name=? and uid<>0" + ") as exists",
 					connector.stripInstancePrefix(username));
 			rs.next();
 			if (rs.getBoolean("exists")) {
@@ -140,13 +150,23 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 
 	public SortedSet<GeoServerUser> getUsers() throws IOException {
 		LOGGER.info("Drupal GroupService loads user list");
+		// Computed before opening our own connection - see
+		// getUsernamesDefinedByOtherUserGroupServices().
+		final Set<String> namesOwnedElsewhere = getUsernamesDefinedByOtherUserGroupServices();
 		TreeSet<GeoServerUser> users = new TreeSet<GeoServerUser>();
 		try {
 			connector.connect();
-			ResultSet rs = connector.getResultSet("select name from users");
+			// Excludes uid=0 - Drupal's own "anonymous"/not-logged-in pseudo-user
+			// (empty name), not a real account.
+			ResultSet rs = connector.getResultSet("select name from users where uid<>0");
 			while (rs.next()) {
-				users.add(new GeoServerUser(connector.addInstancePrefix(rs
-						.getString("name"))));
+				final String prefixedName = connector.addInstancePrefix(rs.getString("name"));
+				if (namesOwnedElsewhere.contains(prefixedName)) {
+					// Another (non-Drupal) service already owns this username -
+					// defer to it rather than also listing it here.
+					continue;
+				}
+				users.add(new GeoServerUser(prefixedName));
 				HashSet<GrantedAuthority> roleset = new HashSet<GrantedAuthority>();
 				roleset.add(new GeoServerRole("schreiber")); // TODO: why is this needed. does the set just need at least one role
 				users.last().setAuthorities(roleset);
@@ -200,7 +220,8 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 		ResultSet rs;
 		try {
 			connector.connect();
-			rs = connector.getResultSet("select count(*) from users");
+			// Excludes uid=0 - see getUsers().
+			rs = connector.getResultSet("select count(*) from users where uid<>0");
 			rs.next();
 			return rs.getInt("count");
 		} catch (SQLException e) {
@@ -217,6 +238,9 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 
 	public SortedSet<String> getUserNamesForRole(GeoServerRole role)
 			throws IOException {
+		// Computed before opening our own connection - see
+		// getUsernamesDefinedByOtherUserGroupServices().
+		final Set<String> namesOwnedElsewhere = getUsernamesDefinedByOtherUserGroupServices();
 		TreeSet<String> userNames = new TreeSet<String>();
 
 		// Add all users of instance having the role
@@ -225,20 +249,25 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 			connector.connect();
 			rs = connector
 					.getResultSet(
-							"select users.name from users join users_roles using(uid) join role using(rid) where role.name =?",
+							// Excludes uid=0 - see getUsers().
+							"select users.name from users join users_roles using(uid) join role using(rid) where role.name=? and users.uid<>0",
 							connector.stripInstancePrefix(role).getAuthority());
 			while (rs.next()) {
-				userNames
-						.add(connector.addInstancePrefix(
-								new GeoServerRole(rs.getString("name")))
-								.getAuthority());
+				final String prefixedName = connector.addInstancePrefix(
+						new GeoServerRole(rs.getString("name"))).getAuthority();
+				if (!namesOwnedElsewhere.contains(prefixedName)) {
+					userNames.add(prefixedName);
+				}
 			}
-			
+
 			if(DRUPAL_ROOT_ROLE.equals(role)){
 				// id=1 means administrative privileges in Drupal
 				rs = connector.getResultSet("select name from users where uid=1");
 				if(rs.next()){
-					userNames.add(connector.addInstancePrefix(rs.getString("name")));
+					final String prefixedName = connector.addInstancePrefix(rs.getString("name"));
+					if (!namesOwnedElsewhere.contains(prefixedName)) {
+						userNames.add(prefixedName);
+					}
 				}
 			}
 		} catch (SQLException e) {
@@ -285,7 +314,74 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 		} finally {
 			connector.disconnect();
 		}
+		promoteConfiguredAdminRoles(roles);
 		return Collections.unmodifiableSortedSet(roles);
+	}
+
+	/**
+	 * Grants {@link GeoServerRole#ADMIN_ROLE} to anyone holding the Drupal
+	 * role configured as this GeoServer's admin role (via the Drupal Role
+	 * Service's "Admin Role" field).
+	 * <p>
+	 * GeoServer's own full-admin check
+	 * (GeoServerSecurityManager#checkAuthenticationForAdminRole) never
+	 * consults a role service's getAdminRole() - it only ever looks for the
+	 * literal "ROLE_ADMINISTRATOR" authority amongst a user's granted roles.
+	 * So rather than requiring a Drupal role to literally be named
+	 * "ROLE_ADMINISTRATOR", this lets any Drupal role be designated as the
+	 * admin role and translates it here, at the point a user's roles are
+	 * actually computed for login.
+	 * <p>
+	 * Deliberately does NOT do the equivalent for
+	 * {@link GeoServerRole#GROUP_ADMIN_ROLE} (despite
+	 * {@link DrupalRoleService#getConfiguredGroupAdminRoleName()} existing) -
+	 * GeoServer's own UI assumes a user holding GROUP_ADMIN_ROLE has a
+	 * populated {@code GroupAdminProperty} (the comma-separated list of user
+	 * groups they administer) on their {@code GeoServerUser} object, e.g.
+	 * org.geoserver.security.web.user.AbstractUserPage does
+	 * {@code for (String groupName : GroupAdminProperty.get(user.getProperties()))}
+	 * whenever the *active* role service reports a user as a group admin -
+	 * GroupAdminProperty.get() returns null (not an empty array) when that
+	 * property was never set, causing a bare NullPointerException right there
+	 * in GeoServer's own code (observed on GeoServer's home page, which looks
+	 * up the built-in XML "admin" account through the active role service
+	 * regardless of who's logged in - it crashed there because a same-named
+	 * Drupal user happened to hold the configured group-admin role). Drupal
+	 * has no user-group concept for GeoServerUserGroupService to expose
+	 * (getUserGroups()/getGroupsForUser() are always empty here), so there is
+	 * no meaningful "administered groups" list to populate that property
+	 * with in the first place - granting GROUP_ADMIN_ROLE this way is not
+	 * safely supportable, whereas full ADMIN_ROLE has no such invariant.
+	 *
+	 * @param roles Mutable set of roles already computed for a user; roles
+	 *              are added to it in place.
+	 */
+	private void promoteConfiguredAdminRoles(Set<GeoServerRole> roles) {
+		final GeoServerSecurityManager manager = GeoServerExtensions
+				.bean(GeoServerSecurityManager.class);
+		// manager can be null this early/late in the application context lifecycle
+		// (e.g. bean lookup during startup/shutdown, or in tests without a full
+		// context), and getActiveRoleService() can itself be null if no role
+		// service is configured as active yet - neither should ever break role
+		// computation, since promotion is purely additive/optional.
+		final GeoServerRoleService activeRoleService = manager == null ? null : manager.getActiveRoleService();
+		if (!(activeRoleService instanceof DrupalRoleService)) {
+			return;
+		}
+		final DrupalRoleService drupalRoleService = (DrupalRoleService) activeRoleService;
+		final String adminRoleName = drupalRoleService.getConfiguredAdminRoleName();
+		if (adminRoleName == null) {
+			return;
+		}
+		// Iterate a copy - we mutate `roles` (the same set) as we go.
+		for (GeoServerRole role : new HashSet<GeoServerRole>(roles)) {
+			final String authority = role.getAuthority();
+			final String bareAuthority = connector.hasInstancePrefix(authority)
+					? connector.stripInstancePrefix(authority) : authority;
+			if (adminRoleName.equals(bareAuthority)) {
+				roles.add(GeoServerRole.ADMIN_ROLE);
+			}
+		}
 	}
 
 	public SortedSet<GeoServerRole> getRoles() throws IOException {
@@ -431,7 +527,75 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 	 * @return True if this instance provided the user and is thus responsible for determining its roles.
 	 */
 	public boolean isResponsibleForUser(String username){
-		return connector.hasInstancePrefix(username);
+		if (!connector.hasInstancePrefix(username)) {
+			return false;
+		}
+		final String bareUsername = connector.stripInstancePrefix(username);
+		if (bareUsername.isEmpty()) {
+			// Drupal's own uid=0 ("anonymous"/not-logged-in) pseudo-user has an
+			// empty name in Drupal's "users" table - it is not a real,
+			// role-bearing account and must never be treated as one.
+			return false;
+		}
+		if (getUsernamesDefinedByOtherUserGroupServices().contains(username)) {
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * @return The usernames already defined by every OTHER *non-Drupal*
+	 *         configured {@link GeoServerUserGroupService} - most commonly
+	 *         GeoServer's own built-in XML "admin" account, which -
+	 *         especially when this service is configured without an
+	 *         instance prefix - can by coincidence share its username with
+	 *         a real Drupal user. Letting two services both answer for the
+	 *         same username produces surprising, hard-to-reason-about role
+	 *         merging (and has caused GeoServer's own home page to NPE - see
+	 *         {@link #promoteConfiguredAdminRoles}), so wherever this
+	 *         service would otherwise surface one of these usernames as its
+	 *         own (as a user it lists, or a user/role it reports on), it
+	 *         defers to the other service instead.
+	 *         <p>
+	 *         Deliberately skips every OTHER {@link DrupalUserGroupService}
+	 *         (including other Drupal instances sharing this GeoServer) -
+	 *         those are disambiguated via each instance's own username
+	 *         prefix already, and consulting another Drupal instance here
+	 *         (which would run this same check right back, checking every
+	 *         *other* instance including this one) risks unbounded mutual
+	 *         recursion between two or more Drupal-backed services.
+	 *         <p>
+	 *         Fetches every other (non-Drupal) service's full user list once
+	 *         rather than looking up one username at a time, so callers that
+	 *         check many usernames (e.g. {@link #getUsers()}) don't pay for
+	 *         a separate round trip to every other service per username.
+	 */
+	private Set<String> getUsernamesDefinedByOtherUserGroupServices() {
+		final Set<String> usernames = new HashSet<String>();
+		final GeoServerSecurityManager manager = GeoServerExtensions
+				.bean(GeoServerSecurityManager.class);
+		if (manager == null) {
+			return usernames;
+		}
+		try {
+			for (GeoServerUserGroupService other : manager.loadUserGroupServices()) {
+				if (other instanceof DrupalUserGroupService) {
+					continue;
+				}
+				try {
+					for (GeoServerUser otherUser : other.getUsers()) {
+						usernames.add(otherUser.getUsername());
+					}
+				} catch (IOException e) {
+					LOGGER.log(Level.WARNING, "Could not list users of user group service '"
+							+ other.getName() + "' to check for username collisions - assuming none.", e);
+				}
+			}
+		} catch (IOException e) {
+			LOGGER.log(Level.WARNING, "Could not list configured user group services to check "
+					+ "for username collisions - assuming none.", e);
+		}
+		return usernames;
 	}
 
 
@@ -470,12 +634,13 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 				LOGGER.info("quering catalog for property " + propname);
 				connector.connect();
 				
-				String query = "select name from users where " + columnName + " ";
+				// Excludes uid=0 - see getUsers().
+				String query = "select name from users where uid<>0 and (" + columnName + " ";
 				if (propop==PropertyQueryOperator.HAS_PROPERTY) {
-					query += "is not null and " + columnName + "is distinct from ''";
+					query += "is not null and " + columnName + "is distinct from '')";
 				}
 				else if (propop==PropertyQueryOperator.NOT_HAS_PROPERTY) {
-					query += "is null or " + columnName + " is not distinct from ''";
+					query += "is null or " + columnName + " is not distinct from '')";
 				}
 				else {
 					throw new IOException("Unsupported PropertyQueryOperator: " + propop.name());
@@ -516,7 +681,8 @@ public class DrupalUserGroupService extends AbstractGeoServerSecurityService
 				LOGGER.info("quering catalog for property " + propname + " and value " + propvalue);
 				connector.connect();
 				
-				String query = "select name from users where " + columnName + " is not distinct from ?";
+				// Excludes uid=0 - see getUsers().
+				String query = "select name from users where uid<>0 and " + columnName + " is not distinct from ?";
 				ResultSet rs = connector.getResultSet(query, propvalue);
 				while (rs.next()) {
 					users.add(new GeoServerUser(connector.addInstancePrefix(rs
